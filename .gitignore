@@ -1,0 +1,13 @@
+# 実行結果 Excel
+*.xlsx
+*.xls
+~$*.xlsx
+
+# 前回順位キャッシュ（任意）
+# prev_ranks.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
