@@ -28,9 +28,9 @@ exit /b 1
 echo  Python: %PYTHON_EXE%
 echo.
 echo  Installing libraries...
-%PYTHON_EXE% -m pip install yfinance openpyxl tqdm --quiet
+%PYTHON_EXE% -m pip install yfinance openpyxl tqdm pytrends --quiet
 echo.
-echo  Starting... (5-10 min)
+echo  Starting... (8-15 min)
 echo.
 cd /d "%SCRIPT_DIR%"
 %PYTHON_EXE% "%SCRIPT_PATH%"

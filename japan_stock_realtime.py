@@ -1,23 +1,26 @@
 """
 =======================================================
-  日本株 中長期銘柄選定ツール - リアルタイム版 v2
+  日本株 中長期銘柄選定ツール - リアルタイム版 v3
   ① Yahoo!ニュース感情AIスコア（日英対応）
   ② 景気サイクル連動セクターローテーション
   ③ 日足テクニカル分析（移動平均・ダウ理論・RSI・MACD）
-  ④ 出来高急増検知（スマートマネー動向）           [NEW]
-  ⑤ EPS成長率トレンド（3期分析）                   [NEW]
-  ⑥ 前回結果との差分ハイライト（順位変動）          [NEW]
-  ⑦ セクター別サマリーシート                        [NEW]
+  ④ 出来高急増検知（スマートマネー動向）
+  ⑤ EPS成長率トレンド（3期分析）
+  ⑥ 前回結果との差分ハイライト（順位変動）
+  ⑦ セクター別サマリーシート
+  ⑧ 価格モメンタム評価（1M/3M/6M/12M）              [NEW]
+  ⑨ Google Trends SNS注目度スコア                   [NEW]
 =======================================================
 
 【実行方法】
-  1. pip install yfinance openpyxl tqdm
+  1. pip install yfinance openpyxl tqdm pytrends
   2. python japan_stock_realtime.py           # 対話でフェーズ選択
      python japan_stock_realtime.py 拡張期    # フェーズを直接指定
   3. 同フォルダに japan_stock_YYYYMMDD_HHMMSS.xlsx が生成されます
   4. tickers.csv を編集して銘柄を自由に追加・削除できます
 
-【所要時間】約5〜10分
+【所要時間】約8〜15分（SNSスコア取得込み）
+【スコア上限】最大140点（旧120点から拡張）
 """
 
 import yfinance as yf
@@ -28,15 +31,24 @@ import time, os, sys, csv, json
 from datetime import datetime
 from collections import defaultdict
 
-# ─── tqdm（任意）────────────────────────────────────────────────────────────
+# ─── オプションライブラリ ──────────────────────────────────────────────────────
 try:
     from tqdm import tqdm
     USE_TQDM = True
 except ImportError:
     USE_TQDM = False
 
-# ─── パス定数 ────────────────────────────────────────────────────────────────
-_DIR = os.path.dirname(os.path.abspath(__file__))
+try:
+    from pytrends.request import TrendReq
+    USE_PYTRENDS = True
+except ImportError:
+    USE_PYTRENDS = False
+
+# ─── 設定 ─────────────────────────────────────────────────────────────────────
+ENABLE_SNS_SCORE = True   # False にすると SNS スコア取得をスキップ（高速化）
+
+# ─── パス定数 ─────────────────────────────────────────────────────────────────
+_DIR           = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_FILE    = os.path.join(_DIR, f"japan_stock_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
 TICKERS_CSV    = os.path.join(_DIR, "tickers.csv")
 PREV_RANKS_FILE = os.path.join(_DIR, "prev_ranks.json")
@@ -103,7 +115,7 @@ SECTOR_ROTATION = {
     "不況期": {"◎":["公益","通信","生活必需品"],      "○":["ヘルスケア"],           "△":["金融","不動産"],        "×":["情報技術","一般消費財","資本財","素材","エネルギー"]},
 }
 SECTOR_SCORE_MAP = {"◎": 20, "○": 14, "△": 7, "×": 0}
-VALID_PHASES = ["回復期", "拡張期", "後退期", "不況期"]
+VALID_PHASES    = ["回復期", "拡張期", "後退期", "不況期"]
 
 # ─── ニュース感情ワード ────────────────────────────────────────────────────────
 POS_WORDS_JA = ["増益","最高益","上方修正","増配","新製品","提携","買収","受注","拡大","成長","回復","黒字","好調","増収","上昇","強化","刷新","供給拡大","新事業","投資拡大","過去最高","躍進","効率化","DX","増額"]
@@ -113,10 +125,9 @@ NEG_WORDS_EN = ["loss","decline","miss","downgrade","cut","reduce","layoff","rec
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  CSV銘柄管理 [C-2]
+#  CSV銘柄管理
 # ════════════════════════════════════════════════════════════════════════════════
 def load_tickers():
-    """tickers.csv があれば読み込む。なければデフォルトを使い CSV を自動生成する。"""
     if os.path.exists(TICKERS_CSV):
         tickers = []
         with open(TICKERS_CSV, encoding="utf-8-sig", newline="") as f:
@@ -126,7 +137,6 @@ def load_tickers():
         if tickers:
             print(f"  tickers.csv から {len(tickers)} 銘柄を読み込みました。")
             return tickers
-    # 初回実行: tickers.csv を生成
     with open(TICKERS_CSV, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["# コード", "銘柄名", "セクター  ← この行はコメント。以下を編集して銘柄追加・削除可"])
@@ -136,10 +146,9 @@ def load_tickers():
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  前回結果の差分管理 [B-4]
+#  差分管理
 # ════════════════════════════════════════════════════════════════════════════════
 def load_prev_ranks():
-    """前回実行時の {コード: 順位} を読み込む。"""
     if os.path.exists(PREV_RANKS_FILE):
         try:
             with open(PREV_RANKS_FILE, encoding="utf-8") as f:
@@ -148,19 +157,18 @@ def load_prev_ranks():
             pass
     return {}
 
-
 def save_prev_ranks(scored_data):
-    """今回の順位を保存する（次回実行時の差分計算用）。"""
-    ranks = {item[8]["code"]: rank + 1 for rank, item in enumerate(scored_data)}
+    # scored_data tuple: (total,sv,sg,sp,sn,ss,st,sm,ssns,grade,d,ns,nt,tech,rank_chg)
+    # d は index 10
+    ranks = {item[10]["code"]: rank + 1 for rank, item in enumerate(scored_data)}
     with open(PREV_RANKS_FILE, "w", encoding="utf-8") as f:
         json.dump(ranks, f, ensure_ascii=False)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  フェーズ選択 [C-1]
+#  フェーズ選択
 # ════════════════════════════════════════════════════════════════════════════════
 def select_phase():
-    """コマンドライン引数 or 対話入力でフェーズを選択する。"""
     if len(sys.argv) > 1:
         phase = sys.argv[1].strip()
         if phase in VALID_PHASES:
@@ -173,8 +181,7 @@ def select_phase():
     print(f"  番号または名前を入力（デフォルト: 拡張期 [Enter]）: ", end="", flush=True)
     try:
         ans = input().strip()
-        if not ans:
-            return "拡張期"
+        if not ans:            return "拡張期"
         if ans.isdigit() and 1 <= int(ans) <= len(VALID_PHASES):
             return VALID_PHASES[int(ans) - 1]
         if ans in VALID_PHASES:
@@ -204,7 +211,7 @@ def fetch_news_for_ticker(ticker_code):
         cutoff = time.time() - 60 * 86400
         for article in news_list[:30]:
             if isinstance(article, dict):
-                content = article.get("content", article)
+                content  = article.get("content", article)
                 pub_time = content.get("pubDate", "") or article.get("providerPublishTime", 0)
                 if isinstance(pub_time, (int, float)) and pub_time > 0 and pub_time < cutoff:
                     continue
@@ -231,21 +238,19 @@ def fetch_news_for_ticker(ticker_code):
 
 
 def fetch_stock_data(ticker_code, name, sector):
-    """株価・財務データ取得。EPS成長率を追加 [A-1]"""
     try:
-        tk = yf.Ticker(ticker_code)
+        tk   = yf.Ticker(ticker_code)
         info = tk.info
-        per = info.get("trailingPE") or info.get("forwardPE") or 0
-        pbr = info.get("priceToBook") or 0
-        roe = (info.get("returnOnEquity") or 0) * 100
+        per        = info.get("trailingPE") or info.get("forwardPE") or 0
+        pbr        = info.get("priceToBook") or 0
+        roe        = (info.get("returnOnEquity") or 0) * 100
         rev_growth = (info.get("revenueGrowth") or 0) * 100
-        op_margin = (info.get("operatingMargins") or 0) * 100
-        div_yield = (info.get("dividendYield") or 0) * 100
-        # EPS成長率 [A-1]: earningsGrowth (YoY) → %
+        op_margin  = (info.get("operatingMargins") or 0) * 100
+        div_yield  = (info.get("dividendYield") or 0) * 100
         eps_growth = (info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth") or 0) * 100
-        current_price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
-        prev_close = info.get("previousClose") or 0
-        price_change = round(current_price - prev_close, 1) if current_price and prev_close else 0
+        current_price   = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+        prev_close      = info.get("previousClose") or 0
+        price_change    = round(current_price - prev_close, 1) if current_price and prev_close else 0
         price_change_pct = round((price_change / prev_close) * 100, 2) if prev_close else 0
         return {
             "code": ticker_code, "name": name, "sector": sector,
@@ -255,7 +260,7 @@ def fetch_stock_data(ticker_code, name, sector):
             "current_price": current_price, "prev_close": prev_close,
             "price_change": price_change, "price_change_pct": price_change_pct,
             "week52_high": info.get("fiftyTwoWeekHigh") or 0,
-            "week52_low": info.get("fiftyTwoWeekLow") or 0,
+            "week52_low":  info.get("fiftyTwoWeekLow")  or 0,
         }
     except Exception as e:
         print(f"  ERR {ticker_code}: {e}")
@@ -263,16 +268,16 @@ def fetch_stock_data(ticker_code, name, sector):
 
 
 def fetch_technical_data(ticker_code):
-    """テクニカル分析。出来高急増検知を追加 [A-3]"""
+    """テクニカル分析 ＋ モメンタム評価（1M/3M/6M/12Mリターン）[⑧]"""
     try:
         tk = yf.Ticker(ticker_code)
         df = tk.history(period="1y", interval="1d")
         if df.empty or len(df) < 30:
             return None
         close = df["Close"]
-        cur = close.iloc[-1]
+        cur   = close.iloc[-1]
 
-        # 移動平均
+        # ── 移動平均 ──────────────────────────────────────────────────────────
         ma5   = close.rolling(5).mean().iloc[-1]   if len(df) >= 5   else None
         ma25  = close.rolling(25).mean().iloc[-1]  if len(df) >= 25  else None
         ma75  = close.rolling(75).mean().iloc[-1]  if len(df) >= 75  else None
@@ -283,7 +288,7 @@ def fetch_technical_data(ticker_code):
         elif ma75  and ma25 and cur < ma25 < ma75:                                 ma_order = "下降配列 ×"
         else:                                                                       ma_order = "混在 △"
 
-        # ゴールデン/デッドクロス
+        # ── ゴールデン/デッドクロス ───────────────────────────────────────────
         cross_signal = "なし"
         if ma25 and ma75 and len(df) >= 75:
             ma25s = close.rolling(25).mean()
@@ -297,13 +302,13 @@ def fetch_technical_data(ticker_code):
                 except Exception:
                     break
 
-        # RSI
+        # ── RSI ──────────────────────────────────────────────────────────────
         delta = close.diff()
         gain  = delta.clip(lower=0).rolling(14).mean().iloc[-1]
         loss  = (-delta).clip(lower=0).rolling(14).mean().iloc[-1]
         rsi   = round(100 - 100 / (1 + gain / loss), 1) if loss and loss > 0 else 100.0
 
-        # MACD
+        # ── MACD ─────────────────────────────────────────────────────────────
         ema12  = close.ewm(span=12, adjust=False).mean()
         ema26  = close.ewm(span=26, adjust=False).mean()
         macd_l = ema12 - ema26
@@ -312,7 +317,7 @@ def fetch_technical_data(ticker_code):
         sig_v  = round(sig_l.iloc[-1], 1)
         hist_v = round(macd_v - sig_v, 1)
 
-        # ダウ理論
+        # ── ダウ理論 ─────────────────────────────────────────────────────────
         recent = close.tail(60); pv = 5; peaks = []; troughs = []
         for i in range(pv, len(recent) - pv):
             win = recent.iloc[i - pv: i + pv + 1]
@@ -322,14 +327,14 @@ def fetch_technical_data(ticker_code):
         if len(peaks) >= 2 and len(troughs) >= 2:
             hh = peaks[-1] > peaks[-2];   hl = troughs[-1] > troughs[-2]
             lh = peaks[-1] < peaks[-2];   ll = troughs[-1] < troughs[-2]
-            if   hh and hl:           dow_trend = "上昇トレンド ▲▲"
-            elif lh and ll:           dow_trend = "下降トレンド ▼▼"
-            elif hh and not hl:       dow_trend = "上昇転換の兆し ▲"
-            elif lh and not ll:       dow_trend = "下降転換の兆し ▼"
-            else:                     dow_trend = "レンジ相場 ─"
+            if   hh and hl:       dow_trend = "上昇トレンド ▲▲"
+            elif lh and ll:       dow_trend = "下降トレンド ▼▼"
+            elif hh and not hl:   dow_trend = "上昇転換の兆し ▲"
+            elif lh and not ll:   dow_trend = "下降転換の兆し ▼"
+            else:                 dow_trend = "レンジ相場 ─"
 
-        # 出来高急増検知 [A-3]
-        volume = df["Volume"]
+        # ── 出来高急増検知 ────────────────────────────────────────────────────
+        volume    = df["Volume"]
         vol_avg90 = volume.tail(90).mean()
         vol_last  = volume.iloc[-1]
         vol_ratio = round(vol_last / vol_avg90, 2) if vol_avg90 > 0 else 1.0
@@ -338,7 +343,41 @@ def fetch_technical_data(ticker_code):
         elif vol_ratio >= 0.7: vol_signal = f"{vol_ratio:.1f}x ─普通"
         else:                  vol_signal = f"{vol_ratio:.1f}x ↓低調"
 
-        # テクニカルスコア計算
+        # ── モメンタム評価（1M/3M/6M/12M） [⑧] ──────────────────────────────
+        def period_return(n):
+            idx = min(n, len(close) - 1)
+            base = close.iloc[-idx - 1] if idx < len(close) else close.iloc[0]
+            return round((cur / base - 1) * 100, 1) if base > 0 else 0.0
+
+        r1m  = period_return(21)   # 約1ヶ月
+        r3m  = period_return(63)   # 約3ヶ月
+        r6m  = period_return(126)  # 約6ヶ月
+        r12m = period_return(252)  # 約12ヶ月
+
+        # モメンタムスコア（最大10pt）
+        ms = 0
+        # 1ヶ月: 最大2pt
+        if   r1m >  10: ms += 2
+        elif r1m >   3: ms += 1
+        elif r1m < -10: ms -= 1
+        # 3ヶ月: 最大3pt
+        if   r3m >  20: ms += 3
+        elif r3m >   8: ms += 2
+        elif r3m >   0: ms += 1
+        elif r3m < -15: ms -= 1
+        # 6ヶ月: 最大3pt
+        if   r6m >  30: ms += 3
+        elif r6m >  15: ms += 2
+        elif r6m >   0: ms += 1
+        elif r6m < -20: ms -= 1
+        # 12ヶ月: 最大2pt
+        if   r12m > 40: ms += 2
+        elif r12m > 20: ms += 1
+        elif r12m < -30: ms -= 1
+
+        momentum_score = max(0, min(10, ms))
+
+        # ── テクニカルスコア計算 ──────────────────────────────────────────────
         ts = 0
         if   "完全上昇" in ma_order:   ts += 6
         elif "上昇配列" in ma_order:   ts += 4
@@ -352,7 +391,6 @@ def fetch_technical_data(ticker_code):
         elif 30 <= rsi < 40:    ts += 2
         elif rsi > 80:          ts -= 1
         if macd_v > sig_v and hist_v > 0: ts += 2
-        # 出来高スコア加算 [A-3]
         if   vol_ratio >= 2.0: ts += 3
         elif vol_ratio >= 1.5: ts += 2
         elif vol_ratio < 0.7:  ts -= 1
@@ -365,10 +403,42 @@ def fetch_technical_data(ticker_code):
             "rsi": rsi, "macd": macd_v, "macd_signal": sig_v, "macd_hist": hist_v,
             "cross_signal": cross_signal, "dow_trend": dow_trend, "ma_order": ma_order,
             "vol_ratio": vol_ratio, "vol_signal": vol_signal,
+            "r1m": r1m, "r3m": r3m, "r6m": r6m, "r12m": r12m,
+            "momentum_score": momentum_score,
             "tech_score": max(0, min(20, ts)),
         }
     except Exception:
         return None
+
+
+def fetch_sns_score(company_name):
+    """
+    Google Trends で銘柄の国内検索注目度を取得 [⑨]
+    ・スコア 0–100（Googleトレンド指数）→ 0–10pt に正規化
+    ・トレンド方向（↑上昇 / ─横ばい / ↓低下）を検出
+    ・pytrends 未インストール / 取得失敗時はスキップ
+    """
+    if not USE_PYTRENDS or not ENABLE_SNS_SCORE:
+        return 0.0, "─(スキップ)"
+    try:
+        time.sleep(1.2)   # レート制限対策
+        pytrends = TrendReq(hl="ja-JP", tz=540, timeout=(10, 30),
+                            retries=2, backoff_factor=0.5)
+        kw = company_name[:20]
+        pytrends.build_payload([kw], cat=0, timeframe="today 3-m", geo="JP", gprop="")
+        df = pytrends.interest_over_time()
+        if df.empty or kw not in df.columns:
+            return 0.0, "─"
+        scores  = df[kw].astype(float)
+        avg     = scores.mean()
+        recent  = scores.tail(4).mean()   # 直近4週
+        if   recent > avg * 1.15: trend_txt = "↑上昇"
+        elif recent < avg * 0.85: trend_txt = "↓低下"
+        else:                     trend_txt = "─横ばい"
+        sns_score = round(min(10.0, avg / 10.0), 1)
+        return sns_score, f"GT:{avg:.0f} {trend_txt}"
+    except Exception:
+        return 0.0, "─(取得失敗)"
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -379,34 +449,32 @@ def score_value(per, pbr):
         max(0, min(10, (30 - per) / 2) if per and per > 0 else 0) +
         max(0, min(10, (5 - pbr) * 2.5) if pbr and pbr > 0 else 0), 1)
 
-
 def score_growth(rg, om, eg=0):
-    """成長性スコア。EPS成長率を追加 [A-1]"""
-    rev_part = min(8, max(0, rg * 0.65) if rg else 0)
-    mar_part = min(8, max(0, om * 0.28) if om else 0)
-    eps_part = min(4, max(0, eg * 0.25) if eg else 0)   # 最大4pt加算
-    return round(rev_part + mar_part + eps_part, 1)
-
+    return round(
+        min(8, max(0, rg * 0.65) if rg else 0) +
+        min(8, max(0, om * 0.28) if om else 0) +
+        min(4, max(0, eg * 0.25) if eg else 0), 1)
 
 def score_profitability(roe, om):
     return round(
         min(10, max(0, roe * 0.45) if roe else 0) +
-        min(10, max(0, om * 0.28) if om else 0), 1)
-
+        min(10, max(0, om  * 0.28) if om  else 0), 1)
 
 def score_news(ns):
     return round((ns + 100) / 10, 1)
 
-
-def compute_total(d, ns, phase, tech):
-    sv = score_value(d["per"], d["pbr"])
-    sg = score_growth(d["rev_growth"], d["op_margin"], d.get("eps_growth", 0))
-    sp = score_profitability(d["roe"], d["op_margin"])
-    sn = score_news(ns)
+def compute_total(d, ns, phase, tech, sns_score=0.0):
+    sv    = score_value(d["per"], d["pbr"])
+    sg    = score_growth(d["rev_growth"], d["op_margin"], d.get("eps_growth", 0))
+    sp    = score_profitability(d["roe"], d["op_margin"])
+    sn    = score_news(ns)
     grade = get_sector_grade(d["sector"], phase)
-    ss = SECTOR_SCORE_MAP[grade]
-    st = tech["tech_score"] if tech else 0
-    return round(sv + sg + sp + sn + ss + st, 1), sv, sg, sp, sn, ss, st, grade
+    ss    = SECTOR_SCORE_MAP[grade]
+    st    = tech["tech_score"]     if tech else 0
+    sm    = tech["momentum_score"] if tech else 0   # モメンタムスコア [⑧]
+    ssns  = round(sns_score, 1)                     # SNS スコア [⑨]
+    total = round(sv + sg + sp + sn + ss + st + sm + ssns, 1)
+    return total, sv, sg, sp, sn, ss, st, sm, ssns, grade
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -421,14 +489,15 @@ BLU_FILL  = PatternFill("solid", fgColor="DDEEFF")
 GRY_FILL  = PatternFill("solid", fgColor="F2F2F2")
 RED_FILL  = PatternFill("solid", fgColor="FFE0E0")
 ORG_FILL  = PatternFill("solid", fgColor="FFF3CD")
-UP_FILL   = PatternFill("solid", fgColor="C8F0C8")   # 順位上昇
-DN_FILL   = PatternFill("solid", fgColor="FFCDD2")   # 順位下落
-NEW_FILL  = PatternFill("solid", fgColor="B3E5FC")   # 新規ランクイン
+UP_FILL   = PatternFill("solid", fgColor="C8F0C8")
+DN_FILL   = PatternFill("solid", fgColor="FFCDD2")
+NEW_FILL  = PatternFill("solid", fgColor="B3E5FC")
+SNS_FILL  = PatternFill("solid", fgColor="EDE7F6")   # SNS列用（薄紫）
+MOM_FILL  = PatternFill("solid", fgColor="E8F5E9")   # モメンタム列用（薄緑）
 THIN = Side(style="thin",   color="BFBFBF")
 MED  = Side(style="medium", color="4472C4")
 THIN_BDR = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 MED_BDR  = Border(left=MED,  right=MED,  top=MED,  bottom=MED)
-
 
 def hdr(ws, r, c, v, w=None):
     cell = ws.cell(row=r, column=c, value=v)
@@ -438,32 +507,33 @@ def hdr(ws, r, c, v, w=None):
     if w: ws.column_dimensions[get_column_letter(c)].width = w
     return cell
 
-
 def dat(ws, r, c, v, fmt=None, fill=None, bold=False, align="center"):
     cell = ws.cell(row=r, column=c, value=v)
     cell.border = THIN_BDR
     cell.alignment = Alignment(horizontal=align, vertical="center")
-    if fmt: cell.number_format = fmt
+    if fmt:  cell.number_format = fmt
     if fill: cell.fill = fill
     cell.font = Font(bold=bold, name="Arial", size=9)
     return cell
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  Excelシート: 銘柄ランキング [B-4 差分ハイライト追加]
+#  Excelシート: 銘柄ランキング（22列 A〜V）
 # ════════════════════════════════════════════════════════════════════════════════
-# scored_data の各要素: (total, sv, sg, sp, sn, ss, st, grade, d, ns, nt, tech, rank_chg)
-# rank_chg: None=新規, int=(前回順位 - 今回順位), 正=上昇, 負=下落, 0=変化なし
+# scored_data tuple:
+#   (total, sv, sg, sp, sn, ss, st, sm, ssns, grade, d, ns, nt, tech, rank_chg)
+#    0      1   2   3   4   5   6   7   8     9      10 11  12  13    14
 
 def build_ranking_sheet(wb, scored_data, phase):
     ws = wb.create_sheet("銘柄ランキング")
     ws.freeze_panes = "A4"
     ws.sheet_view.showGridLines = False
 
-    # タイトル（20列: A〜T）
-    ws.merge_cells("A1:T1")
+    # タイトル（22列: A〜V）
+    ws.merge_cells("A1:V1")
     t = ws["A1"]
-    t.value = f"日本株 中長期銘柄選定ツール v2 - リアルタイムスコアランキング  ({datetime.now().strftime('%Y/%m/%d %H:%M')} 取得)"
+    t.value = (f"日本株 中長期銘柄選定ツール v3 - リアルタイムスコアランキング"
+               f"  ({datetime.now().strftime('%Y/%m/%d %H:%M')} 取得)  【最大140点】")
     t.font = Font(bold=True, size=13, color="1F3864", name="Arial")
     t.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 28
@@ -476,32 +546,34 @@ def build_ranking_sheet(wb, scored_data, phase):
     ws["D2"].fill = YLW_FILL
     ws["D2"].font = Font(bold=True, color="0000FF", size=11, name="Arial")
     ws["D2"].alignment = Alignment(horizontal="center"); ws["D2"].border = MED_BDR
-    ws.merge_cells("E2:T2")
-    ws["E2"].value = "← 回復期 / 拡張期 / 後退期 / 不況期  ｜ ★=TOP3  🔥=出来高急増  ▲=順位UP  ▼=順位DOWN  NEW=新規"
+    ws.merge_cells("E2:V2")
+    ws["E2"].value = ("← 回復期/拡張期/後退期/不況期  ｜  ★TOP3  🔥出来高急増"
+                      "  ▲順位UP  ▼DOWN  NEW=新規  GT=Googleトレンド指数(0-100)")
     ws["E2"].font = Font(italic=True, color="595959", size=9, name="Arial")
     ws["E2"].alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[2].height = 22
 
-    # ヘッダー行（20列）
+    # ヘッダー（22列）
     headers = [
         ("順位",5), ("変動",7), ("コード",10), ("銘柄名",18), ("セクター",13),
         ("現在株価(円)",11), ("前日比(%)",9), ("52週高値",10), ("52週安値",10),
         ("PER(倍)",8), ("PBR(倍)",8), ("ROE(%)",8),
         ("バリュースコア",10), ("成長性スコア",10), ("収益性スコア",10),
         ("ニューススコア",10), ("セクタースコア",10), ("テクニカルスコア",12),
-        ("出来高比率",12), ("総合スコア",10),
+        ("出来高比率",12), ("モメンタム\nスコア",10), ("SNS注目度\nスコア",11),
+        ("総合スコア",10),
     ]
     for i, (h, w) in enumerate(headers, 1):
         hdr(ws, 3, i, h, w)
-    ws.row_dimensions[3].height = 24
+    ws.row_dimensions[3].height = 28
 
     for rank, item in enumerate(scored_data, 1):
-        total, sv, sg, sp, sn, ss, st, grade, d, ns, nt, tech, rank_chg = item
-        row = rank + 3
+        total, sv, sg, sp, sn, ss, st, sm, ssns, grade, d, ns, nt, tech, rank_chg = item
+        row      = rank + 3
         row_fill = GOLD_FILL if rank <= 10 else (GRN_FILL if grade == "◎" else None)
-        star = "★ " if rank <= 3 else ""
+        star     = "★ " if rank <= 3 else ""
 
-        # 順位変動セル [B-4]
+        # 順位変動
         if rank_chg is None:
             chg_txt, chg_fill = "NEW", NEW_FILL
         elif rank_chg > 0:
@@ -511,38 +583,57 @@ def build_ranking_sheet(wb, scored_data, phase):
         else:
             chg_txt, chg_fill = "─", row_fill
 
-        dat(ws, row,  1, f"{rank}",      fill=row_fill, bold=rank <= 3)
-        dat(ws, row,  2, chg_txt,        fill=chg_fill, bold=(rank_chg is None or (rank_chg is not None and rank_chg != 0)))
-        dat(ws, row,  3, d["code"],      fill=row_fill)
-        dat(ws, row,  4, f"{star}{d['name']}", fill=row_fill, bold=rank <= 3, align="left")
-        dat(ws, row,  5, d["sector"],    fill=row_fill)
-        dat(ws, row,  6, d["current_price"] if d["current_price"] else "-", fmt="#,##0", fill=row_fill, bold=True)
-        pct = d["price_change_pct"]
-        dat(ws, row,  7, pct / 100 if pct else 0, fmt="+0.00%;-0.00%;-", fill=row_fill, bold=True)
-        dat(ws, row,  8, d["week52_high"] if d["week52_high"] else "-", fmt="#,##0", fill=row_fill)
-        dat(ws, row,  9, d["week52_low"]  if d["week52_low"]  else "-", fmt="#,##0", fill=row_fill)
-        dat(ws, row, 10, d["per"] if d["per"] else "-", fmt="0.0", fill=row_fill)
-        dat(ws, row, 11, d["pbr"] if d["pbr"] else "-", fmt="0.0", fill=row_fill)
-        dat(ws, row, 12, d["roe"] / 100 if d["roe"] else 0, fmt="0.0%", fill=row_fill)
-        dat(ws, row, 13, sv,    fmt="0.0", fill=row_fill)
-        dat(ws, row, 14, sg,    fmt="0.0", fill=row_fill)
-        dat(ws, row, 15, sp,    fmt="0.0", fill=row_fill)
-        dat(ws, row, 16, sn,    fmt="0.0", fill=row_fill)
-        dat(ws, row, 17, ss,    fmt="0",   fill=row_fill)
-        dat(ws, row, 18, st,    fmt="0.0", fill=row_fill)
-        # 出来高シグナル [A-3]
+        dat(ws, row,  1, f"{rank}",               fill=row_fill, bold=rank <= 3)
+        dat(ws, row,  2, chg_txt,                 fill=chg_fill, bold=rank_chg != 0)
+        dat(ws, row,  3, d["code"],               fill=row_fill)
+        dat(ws, row,  4, f"{star}{d['name']}",    fill=row_fill, bold=rank <= 3, align="left")
+        dat(ws, row,  5, d["sector"],             fill=row_fill)
+        dat(ws, row,  6, d["current_price"] or "-", fmt="#,##0", fill=row_fill, bold=True)
+        dat(ws, row,  7, (d["price_change_pct"] / 100) if d["price_change_pct"] else 0,
+            fmt="+0.00%;-0.00%;-", fill=row_fill, bold=True)
+        dat(ws, row,  8, d["week52_high"] or "-", fmt="#,##0", fill=row_fill)
+        dat(ws, row,  9, d["week52_low"]  or "-", fmt="#,##0", fill=row_fill)
+        dat(ws, row, 10, d["per"]  or "-",        fmt="0.0",   fill=row_fill)
+        dat(ws, row, 11, d["pbr"]  or "-",        fmt="0.0",   fill=row_fill)
+        dat(ws, row, 12, (d["roe"] / 100) if d["roe"] else 0, fmt="0.0%", fill=row_fill)
+        dat(ws, row, 13, sv,  fmt="0.0", fill=row_fill)
+        dat(ws, row, 14, sg,  fmt="0.0", fill=row_fill)
+        dat(ws, row, 15, sp,  fmt="0.0", fill=row_fill)
+        dat(ws, row, 16, sn,  fmt="0.0", fill=row_fill)
+        dat(ws, row, 17, ss,  fmt="0",   fill=row_fill)
+        dat(ws, row, 18, st,  fmt="0.0", fill=row_fill)
+
+        # 出来高比率
         vol_sig = tech["vol_signal"] if tech else "-"
-        vol_fill = PatternFill("solid", fgColor="FFD700") if tech and tech["vol_ratio"] >= 2.0 else \
-                   PatternFill("solid", fgColor="DDEEFF") if tech and tech["vol_ratio"] >= 1.5 else row_fill
+        vol_fill = (PatternFill("solid", fgColor="FFD700") if tech and tech["vol_ratio"] >= 2.0
+                    else PatternFill("solid", fgColor="DDEEFF") if tech and tech["vol_ratio"] >= 1.5
+                    else row_fill)
         dat(ws, row, 19, vol_sig, fill=vol_fill, align="left")
-        dat(ws, row, 20, total, fmt="0.0", fill=row_fill, bold=True)
+
+        # モメンタムスコア [⑧]
+        mom_detail = ""
+        if tech:
+            mom_detail = (f"{tech['r1m']:+.0f}%/{tech['r3m']:+.0f}%/"
+                          f"{tech['r6m']:+.0f}%/{tech['r12m']:+.0f}%")
+        mom_cell_fill = MOM_FILL if sm >= 7 else (DN_FILL if sm <= 2 else row_fill)
+        c20 = dat(ws, row, 20, sm, fmt="0.0", fill=mom_cell_fill, bold=sm >= 7)
+        if mom_detail:
+            c20.comment = None   # コメント追加は省略（openpyxlではcommentオブジェクト必要）
+
+        # SNS注目度スコア [⑨]
+        sns_txt = tech["sns_label"] if tech and "sns_label" in tech else (
+            f"{ssns:.1f}" if ssns else "─")
+        sns_cell_fill = SNS_FILL if ssns >= 5 else row_fill
+        dat(ws, row, 21, ssns, fmt="0.0", fill=sns_cell_fill)
+
+        dat(ws, row, 22, total, fmt="0.0", fill=row_fill, bold=True)
         ws.row_dimensions[row].height = 16
 
     return ws
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  Excelシート: セクター別サマリー [B-1]
+#  Excelシート: セクター別サマリー
 # ════════════════════════════════════════════════════════════════════════════════
 def build_sector_sheet(wb, scored_data, phase):
     ws = wb.create_sheet("セクター分析")
@@ -563,7 +654,7 @@ def build_sector_sheet(wb, scored_data, phase):
 
     sector_data = defaultdict(list)
     for item in scored_data:
-        total, sv, sg, sp, sn, ss, st, grade, d, ns, nt, tech, rank_chg = item
+        total, sv, sg, sp, sn, ss, st, sm, ssns, grade, d, ns, nt, tech, rank_chg = item
         sector_data[d["sector"]].append({
             "name": d["name"], "total": total, "grade": grade,
             "per": d["per"], "roe": d["roe"],
@@ -579,15 +670,15 @@ def build_sector_sheet(wb, scored_data, phase):
     )
 
     for row_idx, (sector, stocks) in enumerate(sectors_sorted, 3):
-        grade = stocks[0]["grade"]
+        grade     = stocks[0]["grade"]
         avg_score = round(sum(s["total"] for s in stocks) / len(stocks), 1)
-        best = max(stocks, key=lambda x: x["total"])
-        pers = [s["per"] for s in stocks if s["per"] > 0]
-        roes = [s["roe"] for s in stocks if s["roe"] > 0]
-        avg_per = round(sum(pers) / len(pers), 1) if pers else 0
-        avg_roe = round(sum(roes) / len(roes), 1) if roes else 0
+        best      = max(stocks, key=lambda x: x["total"])
+        pers      = [s["per"] for s in stocks if s["per"] > 0]
+        roes      = [s["roe"] for s in stocks if s["roe"] > 0]
+        avg_per   = round(sum(pers) / len(pers), 1) if pers else 0
+        avg_roe   = round(sum(roes) / len(roes), 1) if roes else 0
+        fill      = PatternFill("solid", fgColor=grade_colors.get(grade, "FFFFFF"))
 
-        fill = PatternFill("solid", fgColor=grade_colors.get(grade, "FFFFFF"))
         dat(ws, row_idx, 1, sector,        fill=fill, align="left")
         dat(ws, row_idx, 2, grade,         fill=fill, bold=True)
         dat(ws, row_idx, 3, len(stocks),   fill=fill)
@@ -607,27 +698,27 @@ def build_sector_sheet(wb, scored_data, phase):
 #  メイン
 # ════════════════════════════════════════════════════════════════════════════════
 def main():
-    phase = select_phase()
+    phase       = select_phase()
     ticker_list = load_tickers()
-    prev_ranks = load_prev_ranks()
+    prev_ranks  = load_prev_ranks()
 
-    print(f"\n{'='*60}")
-    print(f"  日本株 中長期銘柄選定ツール v2")
+    sns_available = USE_PYTRENDS and ENABLE_SNS_SCORE
+
+    print(f"\n{'='*62}")
+    print(f"  日本株 中長期銘柄選定ツール v3")
     print(f"  景気フェーズ: {phase}  ｜  対象銘柄数: {len(ticker_list)}")
-    if USE_TQDM:
-        print(f"  進捗バー: tqdm 有効")
-    if prev_ranks:
-        print(f"  差分比較: 前回データ あり ({len(prev_ranks)} 銘柄)")
-    else:
-        print(f"  差分比較: 前回データ なし（初回実行）")
-    print(f"{'='*60}\n")
+    print(f"  tqdm進捗バー : {'有効' if USE_TQDM else '無効（pip install tqdm）'}")
+    print(f"  SNSスコア   : {'有効（Google Trends）' if sns_available else '無効（pip install pytrends）'}")
+    print(f"  差分比較    : {'前回データあり' if prev_ranks else '初回実行'}")
+    print(f"  スコア上限  : 最大140点")
+    print(f"{'='*62}\n")
 
-    all_data = []
+    all_data   = []
+    sns_cache  = {}   # company_name → (sns_score, sns_label)
 
-    # [C-4] tqdm 進捗バー
     if USE_TQDM:
         iterator = tqdm(enumerate(ticker_list, 1), total=len(ticker_list),
-                        desc="銘柄取得", unit="銘柄", ncols=72)
+                        desc="銘柄取得", unit="銘柄", ncols=75)
     else:
         iterator = enumerate(ticker_list, 1)
 
@@ -641,17 +732,33 @@ def main():
             continue
 
         ns, nt = fetch_news_for_ticker(code)
-        tech = fetch_technical_data(code)
-        all_data.append((d, ns, nt, tech))
+        tech   = fetch_technical_data(code)
+
+        # SNSスコア取得 [⑨]（同一銘柄名はキャッシュ）
+        if sns_available:
+            if name not in sns_cache:
+                sns_score, sns_label = fetch_sns_score(name)
+                sns_cache[name] = (sns_score, sns_label)
+            else:
+                sns_score, sns_label = sns_cache[name]
+        else:
+            sns_score, sns_label = 0.0, "─"
+
+        # tech dict に SNS ラベルを付加（Excel表示用）
+        if tech:
+            tech["sns_label"] = sns_label
+
+        all_data.append((d, ns, nt, tech, sns_score))
 
         if USE_TQDM:
             ps = f"¥{d['current_price']:,.0f}" if d['current_price'] else "-"
-            iterator.set_postfix({"銘柄": name[:8], "株価": ps})
+            iterator.set_postfix({"銘柄": name[:8], "株価": ps, "SNS": sns_label[:6]})
         else:
-            ps = f"¥{d['current_price']:,.0f}({d['price_change_pct']:+.2f}%)" if d['current_price'] else "-"
-            ts = f"Tech:{tech['tech_score']}pt" if tech else "Tech:-"
-            vs = tech["vol_signal"] if tech else ""
-            print(f"{ps}  {ts}  {vs}  News:{ns:+d}")
+            ps   = f"¥{d['current_price']:,.0f}({d['price_change_pct']:+.2f}%)" if d['current_price'] else "-"
+            ts   = f"Tech:{tech['tech_score']}pt" if tech else "Tech:-"
+            ms_v = f"Mom:{tech['momentum_score']}pt" if tech else "Mom:-"
+            vs   = tech["vol_signal"] if tech else ""
+            print(f"{ps}  {ts}  {ms_v}  {vs}  SNS:{sns_label}  News:{ns:+d}")
 
         time.sleep(0.5)
 
@@ -659,26 +766,23 @@ def main():
 
     # スコアリング & ソート
     scored = []
-    for d, ns, nt, tech in all_data:
-        total, sv, sg, sp, sn, ss, st, grade = compute_total(d, ns, phase, tech)
-        scored.append((total, sv, sg, sp, sn, ss, st, grade, d, ns, nt, tech))
+    for d, ns, nt, tech, sns_score in all_data:
+        total, sv, sg, sp, sn, ss, st, sm, ssns, grade = compute_total(d, ns, phase, tech, sns_score)
+        scored.append((total, sv, sg, sp, sn, ss, st, sm, ssns, grade, d, ns, nt, tech))
     scored.sort(reverse=True)
 
-    # 差分計算 [B-4]
+    # 差分計算
     final = []
     for rank, item in enumerate(scored, 1):
-        total, sv, sg, sp, sn, ss, st, grade, d, ns, nt, tech = item
-        code = d["code"]
-        if code in prev_ranks:
-            rank_chg = prev_ranks[code] - rank   # 正=上昇, 負=下落
-        else:
-            rank_chg = None   # 新規
-        final.append((total, sv, sg, sp, sn, ss, st, grade, d, ns, nt, tech, rank_chg))
+        total, sv, sg, sp, sn, ss, st, sm, ssns, grade, d, ns, nt, tech = item
+        code     = d["code"]
+        rank_chg = (prev_ranks[code] - rank) if code in prev_ranks else None
+        final.append((total, sv, sg, sp, sn, ss, st, sm, ssns, grade, d, ns, nt, tech, rank_chg))
 
-    # 今回順位を保存（次回差分用）
+    # 次回差分用に保存
     save_prev_ranks(final)
 
-    # Excel出力
+    # Excel 出力
     wb = openpyxl.Workbook(); wb.remove(wb.active)
     build_ranking_sheet(wb, final, phase)
     build_sector_sheet(wb, final, phase)
@@ -687,7 +791,8 @@ def main():
     size_kb = os.path.getsize(OUTPUT_FILE) // 1024
     print(f"\n完成: {OUTPUT_FILE}  ({size_kb} KB)")
     print(f"  シート: 銘柄ランキング / セクター分析")
-    print(f"  次回実行時に順位変動（▲▼NEW）が表示されます。\n")
+    print(f"  ⑧ モメンタムスコア（1M/3M/6M/12Mリターン）を追加")
+    print(f"  ⑨ SNS注目度スコア（Google Trends 国内検索指数）を追加\n")
 
 
 if __name__ == "__main__":
