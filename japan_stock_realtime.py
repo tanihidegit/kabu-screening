@@ -8,8 +8,9 @@
   ⑤ EPS成長率トレンド（3期分析）
   ⑥ 前回結果との差分ハイライト（順位変動）
   ⑦ セクター別サマリーシート
-  ⑧ 価格モメンタム評価（1M/3M/6M/12M）              [NEW]
-  ⑨ Google Trends SNS注目度スコア                   [NEW]
+  ⑧ 価格モメンタム評価（1M/3M/6M/12M）
+  ⑨ Google Trends SNS注目度スコア
+  ⑩ スコア根拠コメント自動生成（強み・弱みを日本語で要約） [NEW]
 =======================================================
 
 【実行方法】
@@ -478,6 +479,118 @@ def compute_total(d, ns, phase, tech, sns_score=0.0):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+#  スコア根拠コメント生成
+# ════════════════════════════════════════════════════════════════════════════════
+def generate_comment(d, sv, sg, sp, sn, ss, st, sm, ssns, grade, tech, total):
+    """各スコアの主要因を日本語で簡潔にまとめる（Excel コメント列用）"""
+    pos = []   # ポジティブ要因
+    neg = []   # ネガティブ要因
+
+    # ── バリュー（PER/PBR）──────────────────────────────────────────────────
+    per, pbr = d.get("per", 0), d.get("pbr", 0)
+    if sv >= 14:
+        pos.append(f"超割安(PER{per:.0f}/PBR{pbr:.1f})" if per and pbr else "超割安")
+    elif sv >= 8:
+        pos.append("割安")
+    elif sv <= 2 and (per > 40 or pbr > 4):
+        neg.append(f"割高(PER{per:.0f})" if per > 40 else f"割高(PBR{pbr:.1f})")
+
+    # ── 成長性（売上・利益率・EPS）─────────────────────────────────────────
+    eg = d.get("eps_growth", 0)
+    if sg >= 12:
+        pos.append(f"高成長(EPS{eg:+.0f}%)" if eg and abs(eg) > 5 else "高成長")
+    elif sg >= 6:
+        pos.append("成長良好")
+    if eg <= -15:
+        neg.append(f"EPS減益({eg:.0f}%)")
+    elif eg >= 30 and sg < 12:
+        pos.append(f"EPS急伸({eg:+.0f}%)")
+
+    # ── 収益性（ROE・営業利益率）───────────────────────────────────────────
+    roe = d.get("roe", 0)
+    if sp >= 12:
+        pos.append(f"高収益(ROE{roe:.0f}%)")
+    elif sp <= 2:
+        neg.append("収益性低")
+
+    # ── ニュース感情 ───────────────────────────────────────────────────────
+    if sn >= 16:
+        pos.append("ニュース強気📰")
+    elif sn <= 7:
+        neg.append("ニュース弱気")
+
+    # ── セクターローテーション ─────────────────────────────────────────────
+    if grade == "◎":
+        pos.append("セクター最適◎")
+    elif grade == "○":
+        pos.append("セクター良好○")
+    elif grade == "×":
+        neg.append("セクター逆風×")
+
+    # ── テクニカル ─────────────────────────────────────────────────────────
+    if tech:
+        ma_order     = tech.get("ma_order", "")
+        cross_signal = tech.get("cross_signal", "")
+        dow_trend    = tech.get("dow_trend", "")
+        rsi          = tech.get("rsi", 50)
+        vol_ratio    = tech.get("vol_ratio", 1.0)
+
+        if "完全上昇" in ma_order:
+            pos.append("完全上昇配列")
+        elif "上昇配列" in ma_order:
+            pos.append("上昇配列")
+        elif "下降配列" in ma_order:
+            neg.append("下降配列")
+
+        if "GC" in cross_signal:
+            pos.append(f"GC発生({cross_signal.split('(')[1].rstrip(')')if '(' in cross_signal else '直近'})")
+        elif "DC" in cross_signal:
+            neg.append("DC発生")
+
+        if "上昇トレンド" in dow_trend:
+            pos.append("ダウ上昇▲▲")
+        elif "下降トレンド" in dow_trend:
+            neg.append("ダウ下降▼▼")
+
+        if rsi >= 75:
+            neg.append(f"RSI過熱({rsi:.0f})")
+        elif rsi <= 32:
+            pos.append(f"RSI売られ過ぎ({rsi:.0f})")
+
+        if vol_ratio >= 2.0:
+            pos.append(f"出来高急増🔥({vol_ratio:.1f}x)")
+        elif vol_ratio >= 1.5:
+            pos.append(f"出来高増({vol_ratio:.1f}x)")
+
+    # ── モメンタム ─────────────────────────────────────────────────────────
+    if tech:
+        r3m, r6m = tech.get("r3m", 0), tech.get("r6m", 0)
+        if sm >= 8:
+            pos.append(f"強モメンタム(3M{r3m:+.0f}%/6M{r6m:+.0f}%)")
+        elif sm >= 5:
+            pos.append(f"モメンタム良(3M{r3m:+.0f}%)")
+        elif sm <= 1:
+            neg.append(f"モメンタム弱(3M{r3m:+.0f}%)")
+
+    # ── SNS注目度 ──────────────────────────────────────────────────────────
+    if ssns >= 6:
+        pos.append("SNS注目高📈")
+    elif ssns >= 3:
+        pos.append("SNS注目中")
+
+    # ── コメント組み立て ───────────────────────────────────────────────────
+    parts = []
+    if pos:
+        parts.append("【強】" + "・".join(pos[:4]))  # 最大4要因
+    if neg:
+        parts.append("【弱】" + "・".join(neg[:2]))  # 最大2要因
+    if not parts:
+        parts.append(f"各指標バランス型（総合{total:.0f}pt）")
+
+    return "  ".join(parts)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 #  Excel スタイル定数
 # ════════════════════════════════════════════════════════════════════════════════
 HDR_FILL = PatternFill("solid", fgColor="1F3864")
@@ -529,8 +642,8 @@ def build_ranking_sheet(wb, scored_data, phase):
     ws.freeze_panes = "A4"
     ws.sheet_view.showGridLines = False
 
-    # タイトル（22列: A〜V）
-    ws.merge_cells("A1:V1")
+    # タイトル（23列: A〜W）
+    ws.merge_cells("A1:W1")
     t = ws["A1"]
     t.value = (f"日本株 中長期銘柄選定ツール v3 - リアルタイムスコアランキング"
                f"  ({datetime.now().strftime('%Y/%m/%d %H:%M')} 取得)  【最大140点】")
@@ -546,14 +659,14 @@ def build_ranking_sheet(wb, scored_data, phase):
     ws["D2"].fill = YLW_FILL
     ws["D2"].font = Font(bold=True, color="0000FF", size=11, name="Arial")
     ws["D2"].alignment = Alignment(horizontal="center"); ws["D2"].border = MED_BDR
-    ws.merge_cells("E2:V2")
+    ws.merge_cells("E2:W2")
     ws["E2"].value = ("← 回復期/拡張期/後退期/不況期  ｜  ★TOP3  🔥出来高急増"
                       "  ▲順位UP  ▼DOWN  NEW=新規  GT=Googleトレンド指数(0-100)")
     ws["E2"].font = Font(italic=True, color="595959", size=9, name="Arial")
     ws["E2"].alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[2].height = 22
 
-    # ヘッダー（22列）
+    # ヘッダー（23列）
     headers = [
         ("順位",5), ("変動",7), ("コード",10), ("銘柄名",18), ("セクター",13),
         ("現在株価(円)",11), ("前日比(%)",9), ("52週高値",10), ("52週安値",10),
@@ -561,7 +674,7 @@ def build_ranking_sheet(wb, scored_data, phase):
         ("バリュースコア",10), ("成長性スコア",10), ("収益性スコア",10),
         ("ニューススコア",10), ("セクタースコア",10), ("テクニカルスコア",12),
         ("出来高比率",12), ("モメンタム\nスコア",10), ("SNS注目度\nスコア",11),
-        ("総合スコア",10),
+        ("総合スコア",10), ("スコア根拠コメント",55),
     ]
     for i, (h, w) in enumerate(headers, 1):
         hdr(ws, 3, i, h, w)
@@ -627,6 +740,12 @@ def build_ranking_sheet(wb, scored_data, phase):
         dat(ws, row, 21, ssns, fmt="0.0", fill=sns_cell_fill)
 
         dat(ws, row, 22, total, fmt="0.0", fill=row_fill, bold=True)
+
+        # スコア根拠コメント（col 23）
+        comment_txt = generate_comment(d, sv, sg, sp, sn, ss, st, sm, ssns, grade, tech, total)
+        comment_fill = GOLD_FILL if rank <= 10 else (GRN_FILL if grade == "◎" else GRY_FILL)
+        dat(ws, row, 23, comment_txt, fill=comment_fill, align="left")
+
         ws.row_dimensions[row].height = 16
 
     return ws
